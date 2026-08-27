@@ -1,0 +1,12 @@
+# 核心（elf-sim, gowin, asar-tools, pe-probe）
+unicorn>=2.0
+capstone>=5.0.0
+
+# screen-locator
+rapidocr-onnxruntime
+pillow
+numpy
+
+# sms-otp
+flask
+requests
