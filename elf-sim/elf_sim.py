@@ -711,6 +711,99 @@ class ElfSim:
         return ptr
 
 
+    # ---------------- v5: 反汇编 / 执行控制 / 输出 / 杂项 ----------------
+    def disasm(self, addr, n=1):
+        """反汇编任意地址 n 条（capstone）"""
+        if not _HAS_CAPSTONE:
+            raise RuntimeError('需要 capstone')
+        if not hasattr(self, '_md'):
+            self._md = Cs(CS_ARCH_X86, CS_MODE_64)
+        code = self.read(addr, n * 15)
+        out = []
+        for i in self._md.disasm(code, addr, count=n):
+            out.append(f'0x{i.address:X}: {i.mnemonic} {i.op_str}')
+        return out
+
+    def export_trace(self, path):
+        """指令追踪导出（JSON 列表 [addr, asm]）"""
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(self._instr_trace, f)
+        return path
+
+    def set_output(self, stream):
+        """printf/puts/syscall-write 输出重定向"""
+        self._out_stream = stream
+
+    def _out(self, text):
+        s = getattr(self, '_out_stream', None)
+        if s:
+            s.write(text)
+            try:
+                s.flush()
+            except Exception:
+                pass
+        else:
+            sys.stdout.write(text)
+            sys.stdout.flush()
+
+    def on_stop(self, cb):
+        """执行停止回调 cb(pc)；在 syscall exit 时调用"""
+        self._on_stop = cb
+
+    def _notify_stop(self):
+        cb = getattr(self, '_on_stop', None)
+        if cb:
+            try:
+                cb(self.pc())
+            except Exception:
+                pass
+
+    def step(self):
+        """单步执行一条指令，返回新 PC"""
+        self.mu.emu_start(self.pc(), 0, count=1)
+        return self.pc()
+
+    def continue_until(self, addr, max_steps=10**7):
+        """执行到指定地址"""
+        self.mu.emu_start(self.pc(), addr, count=max_steps)
+        return self.pc()
+
+    def skip_call(self, addr):
+        """标记跳过某地址的 call（命中时 rip+=size, rax=0）"""
+        self._skips = getattr(self, '_skips', set())
+        self._skips.add(addr)
+        if not getattr(self, '_skip_hook_installed', False):
+            self._skip_hook_installed = True
+
+            def h(uc, addr2, size, user):
+                if addr2 in self._skips:
+                    uc.reg_write(UC_X86_REG_RAX, 0)
+                    # 跳过该 call（直接设置 rip 到 call 之后）
+                    uc.reg_write(UC_X86_REG_RIP, addr2 + size)
+            self.mu.hook_add(UC_HOOK_CODE, h)
+
+    def diff_memory(self, addr, size, base_blob):
+        """对比当前内存与 base_blob，返回差异位置列表 [(off, old, new)]"""
+        cur = self.read(addr, size)
+        diffs = []
+        for i in range(min(len(cur), len(base_blob))):
+            if cur[i] != base_blob[i]:
+                diffs.append((i, base_blob[i], cur[i]))
+        return diffs
+
+    def set_seed(self, seed):
+        """rand 桩种子（覆盖 rand 桩为确定性序列）"""
+        import random
+        self._rand = random.Random(seed)
+        # 若有 rand 桩，替换实现
+        for stub_addr, handler in list(self._libc_handlers.items()):
+            pass
+        # 注册 rand 桩（若导入存在）
+        try:
+            self.install_libc_stub('rand', lambda uc: self._rand.randint(0, 0x7FFFFFFF))
+        except KeyError:
+            pass
+
 # ---------------- 便捷 CLI ----------------
 if __name__ == '__main__':
     print('ElfSim v4: from elf_sim import ElfSim')
