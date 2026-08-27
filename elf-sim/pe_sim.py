@@ -157,9 +157,12 @@ class PESim:
                 return False
         self.mu.hook_add(UC_HOOK_MEM_UNMAPPED, hzf)
 
-        # 中断掩码
+        # 中断处理：int3 -> MSVC SEH 链模拟（int3 是混淆/验证跳板）
         def hintr(uc, intno, user):
-            self.log(f'[intr] #{intno:x} @ {hex(uc.reg_read(UC_X86_REG_EIP))}')
+            if intno == 3:  # INT3 -> SEH
+                self._seh_dispatch(uc)
+            else:
+                self.log(f'[intr] #{intno:x} masked @ {hex(uc.reg_read(UC_X86_REG_EIP))}')
         self.mu.hook_add(UC_HOOK_INTR, hintr)
 
         # 导入假桩拦截 + API 日志
@@ -299,10 +302,49 @@ class PESim:
         return self._gate_hits
 
     # ================= KCTF/MSVC 语义桩 =================
-    def set_stdin(self, data):
-        self._stdin_buf = bytearray(data)
+    def _seh_dispatch(self, uc):
+        """MSVC SEH v1：int3 触发 -> 走 fs:[0] 注册链 -> 调用 handler
+        传 4 参 (EXCEPTION_RECORD*, ER*, CONTEXT*, disp)；返回 eax==-1 续执行/1 执行处理器"""
+        try:
+            teb = self.TEB
+            er = struct.unpack('<I', self.read(teb, 4))[0]  # fs:[0] = ExceptionList
+            int3_eip = uc.reg_read(UC_X86_REG_EIP)
+            if er == 0 or er == 0xFFFFFFFF:
+                self.log(f'[seh] int3@{hex(int3_eip)} no handler, skip')
+                # 跳过 int3（1 字节）
+                uc.reg_write(UC_X86_REG_EIP, int3_eip + 1)
+                return
+            prev = struct.unpack('<I', self.read(er, 4))[0]
+            handler = struct.unpack('<I', self.read(er + 4, 4))[0]
+            # EXCEPTION_RECORD 构造（堆）
+            rec = 0x74000000
+            try:
+                self.mu.mem_map(rec, 0x10000)
+            except UcError:
+                pass
+            self.write_mem(rec, struct.pack('<IIIIIII', 0x80000003, 0, 0, int3_eip, 0, 0, 0))
+            ctx = rec + 0x100  # 伪 CONTEXT
+            self.mu.mem_write(ctx, b'\x00' * 0x100)
+            # 压 4 参
+            esp = uc.reg_read(UC_X86_REG_ESP)
+            esp -= 16
+            self.mu.mem_write(esp, struct.pack('<IIII', 0, ctx, er, rec))
+            uc.reg_write(UC_X86_REG_ESP, esp)
+            uc.reg_write(UC_X86_REG_EIP, handler)
+            self.log(f'[seh] int3@{hex(int3_eip)} -> handler@{hex(handler)} (er={hex(er)} prev={hex(prev)})')
+        except Exception as ex:
+            self.log(f'[seh err] {ex}')
+            uc.reg_write(UC_X86_REG_EIP, uc.reg_read(UC_X86_REG_EIP) + 1)
 
-    # ---------- 基础内存工具 ----------
+    def init_seh(self):
+        """在栈上预置一个默认 SEH 链（fs:[0]）——通常程序自己建立，这里兜底"""
+        try:
+            teb = self.TEB
+            cur = struct.unpack('<I', self.read(teb, 4))[0]
+            if cur == 0:
+                self.log('[seh] fs:[0] 未设置')
+        except Exception:
+            pass
     def read(self, addr, size):
         r = self.mu.mem_read(addr, size)
         return bytes(r) if isinstance(r, list) else r
@@ -324,6 +366,9 @@ class PESim:
         esp = uc.reg_read(UC_X86_REG_ESP)
         return struct.unpack_from('<I', self.read(esp + 4 + idx * 4, 4))[0]
 
+
+    def set_stdin(self, data):
+        self._stdin_buf = bytearray(data)
 
     def _stdin_pop_line(self):
         buf = getattr(self, '_stdin_buf', bytearray())
