@@ -804,6 +804,118 @@ class ElfSim:
         except KeyError:
             pass
 
+    # ---------------- v6: 调用树 / 执行统计 / 日志 / 区间hook ----------------
+    def call_tree(self):
+        """记录内部函数调用树（call -> .text 内函数；ret 恢复层级）
+        返回 self._call_tree（list of (depth, func_addr)）"""
+        self._call_tree = []
+        self._call_stack = [0]
+        if not getattr(self, '_calltree_hook', False):
+            self._calltree_hook = True
+            text_lo, text_hi = 0x108D00, 0x108D00 + 5081313  # 默认 .text 范围（覆盖时由子类/配置调整）
+            if '.text' in self.sections:
+                text_lo = self.sections['.text'][0]
+                text_hi = text_lo + self.sections['.text'][2]
+
+            def h(uc, addr, size, user):
+                try:
+                    if size >= 5:
+                        insn = self.read(addr, 5)
+                        if insn[0] == 0xE8:  # call rel32
+                            disp = struct.unpack('<i', insn[1:5])[0]
+                            target = addr + 5 + disp
+                            if text_lo <= target <= text_hi:
+                                self._call_tree.append((len(self._call_stack), target, addr))
+                                self._call_stack.append(target)
+                        elif insn[0] == 0xC3:  # ret
+                            if len(self._call_stack) > 1:
+                                self._call_stack.pop()
+                        elif insn[0] == 0xC2:  # ret imm16
+                            if len(self._call_stack) > 1:
+                                self._call_stack.pop()
+                except Exception:
+                    pass
+            self.mu.hook_add(UC_HOOK_CODE, h)
+        return self._call_tree
+
+    def dump_call_tree(self, symbolizer=None):
+        """格式化输出调用树（text）"""
+        sym = symbolizer or self.where
+        out = []
+        for depth, target, caller in self._call_tree:
+            out.append('  ' * depth + sym(target))
+        return '\n'.join(out)
+
+    # ---------- 执行统计 ----------
+    def exec_stats(self, reset=False):
+        """指令数/调用数/耗时统计（需 hook_stats 开启）"""
+        if not getattr(self, '_stats_hook', False) or reset:
+            self._stats = {'insns': 0, 'calls': 0, 'rets': 0}
+            self._stats_start = time.time()
+            self._stats_hook = True
+
+            def h(uc, addr, size, user):
+                self._stats['insns'] += 1
+                try:
+                    insn = self.read(addr, 5)
+                    if insn[0] == 0xE8:
+                        self._stats['calls'] += 1
+                    elif insn[0] in (0xC3, 0xC2):
+                        self._stats['rets'] += 1
+                except Exception:
+                    pass
+            self.mu.hook_add(UC_HOOK_CODE, h)
+        st = dict(self._stats)
+        st['elapsed'] = round(time.time() - self._stats_start, 3)
+        return st
+
+    # ---------- 日志系统 ----------
+    def set_log(self, path):
+        """将框架日志写入文件"""
+        self._log_file = open(path, 'w', encoding='utf-8')
+
+    def log(self, *args):
+        f = getattr(self, '_log_file', None)
+        line = ' '.join(str(a) for a in args)
+        if f:
+            f.write(line + '\n')
+            f.flush()
+        else:
+            print(line)
+
+    # ---------- 区间内存 hook（低开销精确监控） ----------
+    def memory_region_hook(self, addr, size, on_read=None, on_write=None):
+        """仅监控指定区间的内存访问（比全局 hook 高效）
+        on_read(addr, access_size) / on_write(addr, value, size)"""
+        lo, hi = addr, addr + size
+        blobs = {'writes': []}
+
+        def hw(uc, access, address, sz, value, user):
+            if lo <= address < hi:
+                blobs['writes'].append((address, value, sz))
+                if on_write:
+                    on_write(address, value, sz)
+        self.mu.hook_add(UC_HOOK_MEM_WRITE, hw)
+        if on_read:
+            def hr(uc, access, address, sz, value, user):
+                if lo <= address < hi:
+                    on_read(address, sz)
+        else:
+            hr = None
+        if hr:
+            self.mu.hook_add(UC_HOOK_MEM_READ, hr)
+        return blobs['writes']
+
+    # ---------- 整合开关 ----------
+    def enable_tracing(self, asm=True, calls=False, strings=False):
+        """一键打开：指令追踪(+调用树+字符串收集)"""
+        self.trace_instructions(asm)
+        if calls:
+            self.call_tree()
+        if strings:
+            self.collect_strings()
+        return self
+
 # ---------------- 便捷 CLI ----------------
 if __name__ == '__main__':
     print('ElfSim v4: from elf_sim import ElfSim')
