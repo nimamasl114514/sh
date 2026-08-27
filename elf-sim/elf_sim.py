@@ -1,19 +1,29 @@
 # -*- coding: utf-8 -*-
 """
-elf_sim.py — 自研 ELF 模拟动态执行框架 v3（MiniDBI 思路）
-v3 强化：
-  8. auto_stubs：未实现的导入自动安装通用桩（返回 0 / 返回指针），模拟不中断
-  9. libc 补充桩：printf/sprintf/atoi/strtol/memcmp/strncpy/strcat/strchr/strstr/calloc/malloc/free
-  10. 内存管理：简单堆分配器（malloc/calloc/free 追踪）
-  11. call 追踪：trace_calls() 记录所有 PLT 调用序列（MiniDBI）
-  12. argv 模拟辅助（setup_argv）
-依赖：unicorn 2.x；适用于 Android/Linux x86_64 ELF。
+elf_sim.py — 自研 ELF 模拟动态执行框架 v4（MiniDBI 思路）
+
+v4 新增：
+  13. 断点 API：breakpoints（设/删/命中回调/停止）
+  14. 指令追踪：trace_instructions() 记录执行路径（capstone 反汇编）
+  15. 字符串自动收集：collect_strings() 抓取 .rodata/.data 被访问的字符串常量
+  16. 状态持久化：save_state/load_state（JSON，寄存器+数据区）
+  17. 越界检测：watch_range(addr, size) 记录对该区间的读/写
+  18. 架构检测：ELF e_machine 校验（非 x86_64 明确报错）
+
+依赖：unicorn 2.x（capstone 可选：无则 trace 仅地址）
 """
 import struct
 import sys
 import time
+import json
 from unicorn import *
 from unicorn.x86_const import *
+
+try:
+    from capstone import *
+    _HAS_CAPSTONE = True
+except ImportError:
+    _HAS_CAPSTONE = False
 
 
 class ElfSim:
@@ -29,7 +39,14 @@ class ElfSim:
         self._mem_read_log = []
         self._call_trace = []
         self._auto_stubs = True
+        # v4 新增状态
+        self._breakpoints = {}       # addr -> callback 或 None
+        self._instr_trace = []       # [(addr, asm)]
+        self._trace_on = False
+        self._strings = set()        # v4: 自动收集的字符串
+        self._watches = {}           # (addr,size) -> {'r': n, 'w': n}
         self._parse_symbols()
+        self.symbols_name_rev = {v: k for k, v in self.symbols.items()}
         self.mu = Uc(UC_ARCH_X86, UC_MODE_64)
         self._map_all()
         self._setup_stack()
@@ -41,6 +58,10 @@ class ElfSim:
     def _parse_elf(self):
         d = self.data
         assert d[:4] == b'\x7fELF'
+        self.elf_machine = struct.unpack_from('<H', d, 18)[0]
+        if self.elf_machine != 62:  # EM_X86_64
+            names = {3: 'x86(32)', 62: 'x86_64', 183: 'ARM64', 40: 'ARM', 243: 'RISC-V'}
+            raise NotImplementedError(f'仅支持 x86_64 ELF (machine={self.elf_machine}, {names.get(self.elf_machine)})')
         self.entry = struct.unpack_from('<Q', d, 24)[0]
         e_shoff = struct.unpack_from('<Q', d, 40)[0]
         e_shentsize = struct.unpack_from('<H', d, 58)[0]
@@ -62,9 +83,8 @@ class ElfSim:
         d = self.data
         if '.dynsym' not in self.sections or '.dynstr' not in self.sections:
             return
-        ds, dynstr = self.sections['.dynsym'], self.sections['.dynstr']
-        _, dso, dssz, _ = ds
-        _, dsto, _, _ = dynstr
+        _, dso, dssz, _ = self.sections['.dynsym']
+        _, dsto, _, _ = self.sections['.dynstr']
 
         def cstr(off):
             e = d.index(b'\0', dsto + off)
@@ -88,7 +108,6 @@ class ElfSim:
                 if sym_idx < len(syms):
                     self._rela_plt[syms[sym_idx][0]] = r_offset
                     self.imports[syms[sym_idx][0]] = r_offset
-        # PLT stub 扫描
         try:
             if '.plt' in self.sections and '.got.plt' in self.sections:
                 plt = self.sections['.plt']
@@ -112,6 +131,18 @@ class ElfSim:
         if name in self.imports:
             return self.imports[name]
         raise KeyError(name)
+
+    def where(self, addr):
+        """地址描述：符号名 / 根符号 + 偏移"""
+        if addr in self.symbols_name_rev:
+            return self.symbols_name_rev[addr]
+        best = None
+        for name, va in self.symbols.items():
+            if va <= addr < va + 0x1000 and (best is None or addr - va < addr - best[1]):
+                best = (name, va)
+        if best:
+            return f'{best[0]}+0x{addr - best[1]:X}'
+        return hex(addr)
 
     # ---------------- 内存映射 ----------------
     def _map_all(self):
@@ -137,11 +168,9 @@ class ElfSim:
         self.mu.reg_write(UC_X86_REG_RBP, self.STACK + 0x100000)
 
     def _setup_heap(self):
-        # 简单堆：截取 0x72000000 起 8MB
         self.HEAP = 0x72000000
         self.mu.mem_map(self.HEAP, 0x800000)
         self._heap_cur = self.HEAP
-        self._heap_blocks = {}
 
     # ---------------- 执行 ----------------
     def run(self, entry, until=0, timeout=10**9, max_steps=10**7):
@@ -164,23 +193,19 @@ class ElfSim:
         return self.reg('rax')
 
     def setup_argv(self, args):
-        """在栈上铺 argv/argc，返回 argv 指针（供 __libc_init 样式入口用）"""
         rsp = self.mu.reg_read(UC_X86_REG_RSP)
-        argc = len(args)
-        ptrs = []
-        # 写字符串（从 rsp 往下）
         cur = rsp - 0x1000
+        ptrs = []
         for s in args:
             if isinstance(s, str):
                 s = s.encode()
             self.write_mem(cur, s + b'\x00')
             ptrs.append(cur)
             cur += len(s) + 1
-        # 写 argv 表
         table = rsp - 0x2000
         for i, p in enumerate(ptrs):
             self.write_ptr(table + i * 8, p)
-        self.write_ptr(table + argc * 8, 0)
+        self.write_ptr(table + len(ptrs) * 8, 0)
         return table
 
     # ---------------- 寄存/内存 ----------------
@@ -226,7 +251,7 @@ class ElfSim:
     def dump(self, addr, size):
         return self.read(addr, size)
 
-    # ---------------- Snapshot / Restore ----------------
+    # ---------------- 快照/恢复 ----------------
     def snapshot(self):
         regs = {n: self.reg(n) for n in self._REG}
         stack_lo = self.STACK + 0x100000 - 0x10000
@@ -239,7 +264,150 @@ class ElfSim:
         stack = bytes(snap['stack']) if not isinstance(snap['stack'], bytes) else snap['stack']
         self.write_mem(snap['stack_lo'], stack)
 
-    # ---------------- Hooks ----------------
+    # ---------------- v4: 断点 ----------------
+    def add_breakpoint(self, addr, cb=None):
+        """设置执行断点。cb(addr, insn_size) 返回 False 停止；无 cb 默认停止"""
+        self._breakpoints[addr] = cb
+
+    def remove_breakpoint(self, addr):
+        self._breakpoints.pop(addr, None)
+
+    def list_breakpoints(self):
+        return list(self._breakpoints)
+
+    def _ensure_hooks_installed(self):
+        """安装统一的 code hook（断点/trace/watch 复用，幂等）"""
+        if getattr(self, '_hooks_installed', False):
+            return
+        stubs_map = dict(self._libc_handlers)
+        bp = self._breakpoints
+        self._hooks_installed = True
+
+        def code_hook(uc, addr, size, user):
+            # 1) 断点
+            if addr in bp:
+                cb = bp[addr]
+                hit = (cb(addr, size) if cb else None)
+                if hit is False or cb is None:
+                    uc.emu_stop()
+                    return
+            # 2) 指令追踪
+            if self._trace_on:
+                self._instr_trace.append((addr, self._disasm(addr, size)))
+            # 3) libc 桩拦截
+            try:
+                if size >= 5:
+                    insn = self.read(addr, 5)
+                    if insn[0] == 0xE8:
+                        disp = struct.unpack('<i', insn[1:5])[0]
+                        target = addr + 5 + disp
+                        if target in stubs_map:
+                            rax = stubs_map[target](uc)
+                            uc.reg_write(UC_X86_REG_RAX, rax)
+                            uc.reg_write(UC_X86_REG_RIP, addr + 5)
+            except Exception:
+                pass
+        self.mu.hook_add(UC_HOOK_CODE, code_hook)
+
+    def _disasm(self, addr, size):
+        if not _HAS_CAPSTONE:
+            return f'0x{addr:X}'
+        try:
+            md = Cs(CS_ARCH_X86, CS_MODE_64) if not hasattr(self, '_md') else self._md
+            if not hasattr(self, '_md'):
+                self._md = md
+            for i in md.disasm(self.read(addr, min(size, 15)), addr, count=1):
+                return f'0x{addr:X}: {i.mnemonic} {i.op_str}'
+        except Exception:
+            pass
+        return f'0x{addr:X}'
+
+    # ---------------- v4: 指令追踪 ----------------
+    def trace_instructions(self, on=True):
+        """开始/停止记录执行路径（addr + 反汇编）"""
+        self._trace_on = on
+        if on:
+            self._instr_trace = []
+        self._ensure_hooks_installed()
+        return self._instr_trace
+
+    @property
+    def instr_trace(self):
+        return self._instr_trace
+
+    # ---------------- v4: 字符串自动收集 ----------------
+    def collect_strings(self):
+        """收集执行中被引用（读 .rodata/.data）的字符串常量"""
+        self._strings = set()
+        self._ensure_hooks_installed()
+
+        def h(uc, access, address, size, value, user):
+            # 只记录读 .rodata/.data 区可打印字符串
+            try:
+                if access == UC_MEM_READ:
+                    for sec in ('.rodata', '.data'):
+                        if sec in self.sections:
+                            sa, _, ss, _ = self.sections[sec]
+                            if sa <= address < sa + ss and size >= 2:
+                                b = self.read(address, min(128, 4096))
+                                if b and all(32 <= c < 127 or c in (9, 10, 13) for c in b[:32]):
+                                    i = b.find(b'\x00')
+                                    s = (b[:i] if i != -1 else b[:32]).decode('ascii', 'replace')
+                                    if len(s) >= 4 and s.isprintable():
+                                        self._strings.add(s)
+            except Exception:
+                pass
+        self.mu.hook_add(UC_HOOK_MEM_READ, h)
+        return self._strings
+
+    @property
+    def strings(self):
+        return self._strings
+
+    # ---------------- v4: 区间监视 ----------------
+    def watch_range(self, addr, size):
+        """监视区间读写（记录次数）"""
+        self._watches[(addr, addr + size)] = {'r': 0, 'w': 0}
+        self._ensure_hooks_installed()
+
+        def h(uc, access, address, size2, value, user):
+            for (lo, hi), st in self._watches.items():
+                if lo <= address < hi:
+                    if access == UC_MEM_READ:
+                        st['r'] += 1
+                    elif access in (UC_MEM_WRITE, UC_MEM_WRITE_UNMAPPED):
+                        st['w'] += 1
+        self.mu.hook_add(UC_HOOK_MEM_READ, h)
+        self.mu.hook_add(UC_HOOK_MEM_WRITE, h)
+
+    @property
+    def watches(self):
+        return self._watches
+
+    # ---------------- v4: 状态持久化 ----------------
+    def save_state(self, path):
+        """保存寄存器 + 数据区差异（JSON）"""
+        regs = {n: self.reg(n) for n in self._REG}
+        # 保存 .data 区（可能被解密修改）
+        data_sec = self.sections.get('.data')
+        data_blob = None
+        if data_sec:
+            data_blob = self.read(data_sec[0], data_sec[2]).hex()
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'machine': self.elf_machine, 'regs': regs, 'data': data_blob}, f)
+        return path
+
+    def load_state(self, path):
+        with open(path, encoding='utf-8') as f:
+            st = json.load(f)
+        for n, v in st['regs'].items():
+            self.set_reg(n, v)
+        if st.get('data') and '.data' in self.sections:
+            blob = bytes.fromhex(st['data'])
+            self.write_mem(self.sections['.data'][0], blob)
+        return True
+
+    # ---------------- Hooks（原 API 保留） ----------------
     def hook_code(self, cb):
         self.mu.hook_add(UC_HOOK_CODE, cb)
 
@@ -263,14 +431,11 @@ class ElfSim:
         return log
 
     def trace_calls(self):
-        """记录所有 call 到导入 PLT 的调用序列（MiniDBI）"""
         self._call_trace = []
-        # stub addr -> name（libc handlers + imports）
         name_by_addr = {}
         for name, addr in self.imports.items():
             name_by_addr[addr] = name
         for addr, handler in self._libc_handlers.items():
-            # handler key 是 stub addr（install_libc_stub 存过）
             name_by_addr[addr] = name_by_addr.get(addr, f'stub_{addr:X}')
 
         def h(uc, addr, size, user):
@@ -287,16 +452,13 @@ class ElfSim:
         self.mu.hook_add(UC_HOOK_CODE, h)
         return self._call_trace
 
-    def _rebuild_stub_map(self):
-        return self._libc_handlers
-
     # ---------------- syscall 拦截 ----------------
     def _install_syscall_hook(self):
         def h(uc, user):
             n = uc.reg_read(UC_X86_REG_RAX)
-            if n in (60, 231):  # exit / exit_group
+            if n in (60, 231):
                 uc.emu_stop()
-            elif n == 1:  # write
+            elif n == 1:
                 fd = uc.reg_read(UC_X86_REG_RDI)
                 buf = uc.reg_read(UC_X86_REG_RSI)
                 cnt = uc.reg_read(UC_X86_REG_RDX)
@@ -310,15 +472,15 @@ class ElfSim:
                 uc.reg_write(UC_X86_REG_RAX, cnt)
             elif n == 0:
                 uc.reg_write(UC_X86_REG_RAX, 0)
-            elif n == 9:  # mmap
+            elif n == 9:
                 uc.reg_write(UC_X86_REG_RAX, 0x74000000)
-            elif n == 12:  # brk
+            elif n == 12:
                 uc.reg_write(UC_X86_REG_RAX, self._heap_cur + 0x1000)
-            elif n == 228:  # clock_gettime
+            elif n == 228:
                 uc.reg_write(UC_X86_REG_RAX, 0)
-            elif n in (35, 130):  # nanosleep
+            elif n in (35, 130):
                 uc.reg_write(UC_X86_REG_RAX, 0)
-            elif n == 7:  # poll
+            elif n == 7:
                 uc.reg_write(UC_X86_REG_RAX, 0)
             else:
                 uc.reg_write(UC_X86_REG_RAX, 0)
@@ -370,34 +532,7 @@ class ElfSim:
                 self.install_libc_stub(name, h)
             except KeyError:
                 pass
-
-        # 核心拦截机制：call 到 stub 时执行桩；未注册导入自动 fallback
-        stubs_map = dict(self._libc_handlers)
-
-        def code_hook(uc, addr, size, user):
-            try:
-                if size >= 5:
-                    insn = self.read(addr, 5)
-                    if insn[0] == 0xE8:  # call rel32
-                        disp = struct.unpack('<i', insn[1:5])[0]
-                        target = addr + 5 + disp
-                        # 1) 已注册桩
-                        if target in stubs_map:
-                            rax = stubs_map[target](uc)
-                            uc.reg_write(UC_X86_REG_RAX, rax)
-                            uc.reg_write(UC_X86_REG_RIP, addr + 5)
-                        elif self._auto_stubs:
-                            # 2) 未注册导入 -> 自动 fallback（返回 0）
-                            for stub, name in self._stub_name.items() if hasattr(self, '_stub_name') else []:
-                                pass
-                # 3) 未注册导入的自动桩（通过 imports 反向）
-                if self._auto_stubs:
-                    for sname, saddr in self.imports.items():
-                        if saddr == 0:
-                            continue
-            except Exception:
-                pass
-        self.mu.hook_add(UC_HOOK_CODE, code_hook)
+        self._ensure_hooks_installed()
 
     def enable_auto_stubs(self, on=True):
         self._auto_stubs = on
@@ -437,7 +572,9 @@ class ElfSim:
         dst, n = self._arg(uc, 0), self._arg(uc, 2)
         s = self.read_str(self._arg(uc, 1), n + 1) if n else ''
         data = s.encode()[:n]
-        self.write_mem(dst, data + b'\x00' * (n - len(data)) if n > len(data) else data)
+        if n > len(data):
+            data += b'\x00' * (n - len(data))
+        self.write_mem(dst, data)
         return dst
 
     def _s_strcat(self, uc):
@@ -466,7 +603,6 @@ class ElfSim:
         return 0
 
     def _fmt_args(self, uc):
-        """从栈取 varargs（fmt 在 rdi，args 从 rsp+8 开始）"""
         rsp = uc.reg_read(UC_X86_REG_RSP)
         args = []
         for i in range(8):
@@ -474,16 +610,18 @@ class ElfSim:
         return args
 
     def _parse_fmt(self, fmt, args):
-        import re
         out = []
         ai = 0
         i = 0
         while i < len(fmt):
             if fmt[i] == '%' and i + 1 < len(fmt):
                 spec = fmt[i:i+2]
-                if spec in ('%s', '%.s', '%d', '%i', '%x', '%X', '%u', '%f', '%p', '%c', '%ld', '%.*s'):
+                if spec in ('%s', '%d', '%i', '%x', '%X', '%u', '%f', '%p', '%c', '%ld', '%.s'):
                     if spec == '%s':
-                        out.append(self.read_str(args[ai], 4096))
+                        try:
+                            out.append(self.read_str(args[ai], 4096))
+                        except Exception:
+                            out.append(f'<ptr:{args[ai]}>')
                         ai += 1
                     elif spec in ('%d', '%i', '%u', '%x', '%X', '%ld'):
                         out.append(str(args[ai]))
@@ -500,7 +638,7 @@ class ElfSim:
                     else:
                         out.append(spec)
                     i += 2
-                elif fmt[i] == '%' and fmt[i+1] == '%':
+                elif fmt[i+1] == '%':
                     out.append('%')
                     i += 2
                 else:
@@ -514,7 +652,6 @@ class ElfSim:
     def _s_printf(self, uc):
         fmt = self.read_str(self._arg(uc, 0), 2048)
         rsp = uc.reg_read(UC_X86_REG_RSP)
-        # varargs：rsp 处是返回地址（被我们改过），实际 args 在 rsp+8 起（顺序填充）
         vals = []
         for i in range(1, 9):
             try:
@@ -559,7 +696,6 @@ class ElfSim:
         size = self._arg(uc, 0)
         if size == 0:
             size = 1
-        # 对齐 16
         size = (size + 15) & ~15
         if self._heap_cur + size > self.HEAP + 0x800000:
             return 0
@@ -569,20 +705,17 @@ class ElfSim:
 
     def _s_calloc(self, uc):
         nmemb, size = self._arg(uc, 0), self._arg(uc, 1)
-        total = nmemb * size
         ptr = self._s_malloc(uc)
         if ptr:
-            self.write_mem(ptr, b'\x00' * min(total, 4096))
+            self.write_mem(ptr, b'\x00' * min(nmemb * size, 4096))
         return ptr
-
-    def _s_time_gettimeofday(self, uc):
-        return 0
 
 
 # ---------------- 便捷 CLI ----------------
 if __name__ == '__main__':
-    print('ElfSim v3: from elf_sim import ElfSim')
-    print('  sim = ElfSim("x.elf")          # 自动安装 libc 桩 + auto-stubs')
-    print('  sim.call(sim.from_symbol("main"))')
-    print('  sim.trace_calls()              # 记录 PLT 调用序列')
-    print('  sim.setup_argv(["a","b"])      # argv 铺栈')
+    print('ElfSim v4: from elf_sim import ElfSim')
+    print('  sim = ElfSim("x.elf")')
+    print('  sim.add_breakpoint(addr, cb)        # 断点')
+    print('  sim.trace_instructions()            # 指令追踪')
+    print('  sim.collect_strings()               # 字符串收集')
+    print('  sim.save_state("s.json")            # 状态持久化')
