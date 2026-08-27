@@ -1,32 +1,31 @@
-# elf_sim.py — 自研 ELF 模拟动态执行框架 v7（双架构 x86_64 + ARM64）
+# elf_sim.py — 自研 ELF 模拟动态执行框架 v9（双架构 + 图输出）
 
 绕过 linker 直接调用 ELF 任意函数，hook 指令/内存，dump 解密数据。自研 MiniDBI，双架构。
 
-## v7：ARM64 后端
-- 自动架构检测（ELF machine: 62=x86_64 / 183=AArch64）
-- ARM64：参数 x0-x7 / bl 调用识别 / ret 检测 / svc(syscall) 拦截 / AArch64 标准 PLT（16B entry → .rela.plt）
-- capstone ARM64 反汇编 / 寄存器体系 / 全部观察能力通用（断点/追踪/调用树/桩/差分/持久化）
-- 无节表最小 ELF 支持（按 PT_LOAD 程序头映射）
-- 第三方：Unicorn 原生 ARM64 引擎（允许，已用）
+## v9 新增：直接出图
+- **架构图**：`callgraph_dot()` / `callgraph_mermaid()`（节点=函数 where() 符号化、边=调用次数）一键 `export_diagrams()` 落盘
+- **变量生命周期图**：`track_variables()`（记录 .data/.bss 写/读事件）→ `variable_lifecycle()`（每变量：诞生=首次写 / 使用=读次 / 消亡=被覆盖）→ 三种出图：`var_lifecycle_dot()` / `var_lifecycle_mermaid()` / `var_lifecycle_table()`
 
-## 全部能力（v2-v7 汇总）
-1. 符号体系（.dynsym/.rela.plt/.plt），from_symbol/where
-2. libc 桩 30+（printf/malloc/atoi/strcmp/memcpy...）+ auto-stubs
-3. 堆分配器 / argv / syscall 拦截（双架构 SYS 号表）
-4. 断点 / 指令追踪 / 字符串收集 / 区间监视 / 状态持久化 / 架构检测
-5. 反汇编 / 输出重定向 / 单步 / continue_until / skip_call / 内存差分 / export_trace / set_seed
-6. 调用树 / 执行统计 / 日志 / 区间 hook / enable_tracing
+## 全部能力汇总（v2-v9）
+| 类别 | 能力 |
+|---|---|
+| 架构 | x86_64 + ARM64 自动检测（寄存器/ABI/bl-ret/svc/PLT 双后端） |
+| 符号 | .dynsym/.rela.plt/.plt → from_symbol()/where() |
+| 执行 | call(按名/按址)/run/step/continue_until/setup_argv |
+| 桩 | libc 30+（printf/malloc/atoi...）+ auto-stubs + 自定义 |
+| 内存 | 堆分配器/追踪/差分/区间 hook/snapshot-restore/save-load |
+| 观察 | 断点/指令追踪/call_tree/字符串收集/exec_stats/watch_range |
+| 清洗 | reconstruct_function（带符号+字符串+段归属注释）/generate_c_stub/imports.h/export_project |
+| **图** | **callgraph dot+mermaid / 变量生命周期 dot+mermaid+表格** |
 
-## 用法（双架构同 API）
+## 用法
 ```python
 from elf_sim import ElfSim
-sim = ElfSim('target.elf')        # 自动检测 x86_64 / ARM64
-sim.enable_tracing(asm=True, calls=True)
-sim.call(sim.from_symbol('main'))  # 按名调用（参数自动按架构）
-print(sim.dump_call_tree())
-print(sim.exec_stats())
+sim = ElfSim('x.elf')
+sim.track_variables()
+sim.call_tree()
+sim.call(sim.from_symbol('main'))
+print(sim.callgraph_mermaid())      # 架构图
+print(sim.var_lifecycle_table())    # 变量生命周期表
+sim.export_diagrams('out/')         # 一键落盘全部图
 ```
-
-## 实测
-- x86_64（Android BOLT ELF）：240 导入全解析、解密命中 imei/wy.llua、调用树 3 层
-- ARM64（构造 ELF）：加载/执行 ret/寄存器/反汇编全通

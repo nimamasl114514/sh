@@ -1119,5 +1119,166 @@ class ElfSim:
         json.dump(meta, open(os.path.join(outdir, 'meta.json'), 'w', encoding='utf-8'), indent=1)
         return {'dir': outdir, 'functions': len(files), 'meta': meta}
 
+    # ---------------- v9: 架构图 + 变量生命周期图 ----------------
+    def callgraph_edges(self):
+        """从调用树聚出边表 [(caller, callee, count)]"""
+        import collections
+        cnt = collections.Counter()
+        for depth, target, caller in getattr(self, '_call_tree', []):
+            cnt[(caller, target)] += 1
+        return [(c, t, n) for (c, t), n in cnt.items()]
+
+    def callgraph_dot(self):
+        """架构图：Graphviz DOT（节点=函数，边=调用，标次数）"""
+        lines = ['digraph callgraph {', '  rankdir=LR;', '  node [shape=box, style=filled, fillcolor="#eef"];']
+        edges = self.callgraph_edges()
+        nodes = set()
+        for c, t, n in edges:
+            nodes.add(c)
+            nodes.add(t)
+        for nd in sorted(nodes):
+            label = self.where(nd)
+            lines.append(f'  "0x{nd:X}" [label="{label}"];')
+        for c, t, n in edges:
+            lines.append(f'  "0x{c:X}" -> "0x{t:X}" [label="{n}"];')
+        lines.append('}')
+        return '\n'.join(lines)
+
+    def callgraph_mermaid(self):
+        """架构图：Mermaid flowchart"""
+        edges = self.callgraph_edges()
+        nodes = set()
+        for c, t, n in edges:
+            nodes.add(c)
+            nodes.add(t)
+        ids = {nd: f'f{i}' for i, nd in enumerate(sorted(nodes))}
+        lines = ['flowchart LR']
+        for nd, fid in sorted(ids.items(), key=lambda kv: kv[1]):
+            lines.append(f'  {fid}[{self.where(nd)}]')
+        for c, t, n in edges:
+            lines.append(f'  {ids[c]} -->|{n}| {ids[t]}')
+        return '\n'.join(lines)
+
+    def track_variables(self, ranges=None):
+        """开启变量追踪：记录 .data/.bss（或指定区间）的写(诞生/覆盖)与读(使用)
+        之后用 variable_lifecycle() 聚合。"""
+        if ranges is None:
+            ranges = []
+            for sn in ('.data', '.bss'):
+                if sn in self.sections:
+                    sa, _o, ssz, _t = self.sections[sn]
+                    ranges.append((sa, sa + ssz))
+        self._var_events = []
+        lohi = tuple(ranges)
+
+        def hw(uc, access, address, size, value, user):
+            for lo, hi in lohi:
+                if lo <= address < hi:
+                    self._var_events.append((address & ~7, 'W', value & 0xFF, size))
+                    return
+            for lo, hi in lohi:
+                pass
+
+        def hr(uc, access, address, size, value, user):
+            for lo, hi in lohi:
+                if lo <= address < hi:
+                    self._var_events.append((address & ~7, 'R', None, size))
+                    return
+        self.mu.hook_add(UC_HOOK_MEM_WRITE, hw)
+        self.mu.hook_add(UC_HOOK_MEM_READ, hr)
+        return self._var_events
+
+    def variable_lifecycle(self):
+        """聚合变量事件 → 生命周期表
+        每个变量(addr): birth=首次写, death=最后一次写(被覆盖即旧值死亡), reads=读次数, writes=写次数
+        返回按 birth 排序的列表"""
+        import collections
+        evs = getattr(self, '_var_events', None)
+        if evs is None:
+            return []
+        info = {}
+        order = []
+        for addr, kind, val, size in evs:
+            if addr not in info:
+                info[addr] = {'addr': addr, 'birth_ev': None, 'last_w_ev': None,
+                              'reads': 0, 'writes': 0}
+                order.append(addr)
+            ent = info[addr]
+            idx = len(ent.get('_seq', []))
+            ent.setdefault('_seq', []).append(kind)
+            if kind == 'W':
+                ent['writes'] += 1
+                if ent['birth_ev'] is None:
+                    ent['birth_ev'] = idx
+                ent['last_w_ev'] = idx
+            else:
+                ent['reads'] += 1
+        res = []
+        for addr in order:
+            e = info[addr]
+            seq = e['_seq']
+            reads_after_last_write = sum(1 for k in seq[e['last_w_ev']+1:] if k == 'R') if e['last_w_ev'] is not None else e['reads']
+            res.append({
+                'addr': hex(e['addr']),
+                'birth': 'write#' + str(e['birth_ev']) if e['birth_ev'] is not None else '-',
+                'writes': e['writes'],
+                'reads': e['reads'],
+                'alive_reads_after_death': reads_after_last_write,
+                'state': ('live' if e['birth_ev'] is not None else 'read-only') +
+                         ('(+pending reads)' if reads_after_last_write else ''),
+            })
+        res.sort(key=lambda x: x['birth'])
+        return res
+
+    def var_lifecycle_mermaid(self, limit=40):
+        """变量生命周期图：Mermaid（流程式：诞生→使用→消亡）"""
+        rows = self.variable_lifecycle()[:limit]
+        lines = ['flowchart LR', '  subgraph 变量生命周期']
+        for i, r in enumerate(rows):
+            vid = f'v{i}'
+            lines.append(f'  {vid}["{r["addr"]}"]')
+            lines.append(f'  B{i}(诞生:{r["birth"]}) --> {vid}')
+            lines.append(f'  {vid} -->|读x{r["reads"]} 写x{r["writes"]}| U{i}(使用)')
+            lines.append(f'  {vid} --> D{i}(状态:{r["state"]})')
+        lines.append('  end')
+        return '\n'.join(lines)
+
+    def var_lifecycle_table(self, limit=50):
+        """变量生命周期：Markdown 表格（可直接贴文档）"""
+        rows = self.variable_lifecycle()[:limit]
+        lines = ['| 变量地址 | 诞生 | 写 | 读 | 状态 |', '|---|---|---|---|---|']
+        for r in rows:
+            lines.append(f"| {r['addr']} | {r['birth']} | {r['writes']} | {r['reads']} | {r['state']} |")
+        return '\n'.join(lines)
+
+    def var_lifecycle_dot(self, limit=40):
+        """变量生命周期 DOT"""
+        rows = self.variable_lifecycle()[:limit]
+        lines = ['digraph varlife {', '  rankdir=LR;', '  node [shape=ellipse];']
+        for i, r in enumerate(rows):
+            lines.append(f'  B{i} [label="birth\n{r["birth"]}"];')
+            lines.append(f'  V{i} [label="var {r["addr"]}"];')
+            lines.append(f'  U{i} [label="use r={r["reads"]} w={r["writes"]}"];')
+            lines.append(f'  D{i} [label="{r["state"]}"];')
+            lines.append(f'  B{i} -> V{i} -> U{i} -> D{i};')
+        lines.append('}')
+        return '\n'.join(lines)
+
+    def export_diagrams(self, outdir):
+        """一键导出全部图：架构图(callgraph.dot/.mmd) + 变量生命周期图(vars.dot/.mmd/.md)"""
+        import os
+        os.makedirs(outdir, exist_ok=True)
+        open(os.path.join(outdir, 'callgraph.dot'), 'w', encoding='utf-8').write(self.callgraph_dot())
+        open(os.path.join(outdir, 'callgraph.mmd'), 'w', encoding='utf-8').write(self.callgraph_mermaid())
+        vl_dot = self.var_lifecycle_dot()
+        vl_mmd = self.var_lifecycle_mermaid()
+        vl_md = self.var_lifecycle_table()
+        open(os.path.join(outdir, 'variables.dot'), 'w', encoding='utf-8').write(vl_dot)
+        open(os.path.join(outdir, 'variables.mmd'), 'w', encoding='utf-8').write(vl_mmd)
+        open(os.path.join(outdir, 'variables.md'), 'w', encoding='utf-8').write(vl_md)
+        return {'outdir': outdir,
+                'files': ['callgraph.dot', 'callgraph.mmd', 'variables.dot', 'variables.mmd', 'variables.md'],
+                'vars_tracked': len(getattr(self, '_var_events', []) or [])}
+
 if __name__ == '__main__':
     print('ElfSim v7 (双架构 x86_64/ARM64): from elf_sim import ElfSim')
